@@ -1678,6 +1678,19 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
         _require_task(conn, task_id)
+        # Dedupe against the immediately preceding comment: a re-dispatched
+        # worker re-posts the same report verbatim (board incident 2026-10-21:
+        # 644 identical rows on one card). Same author + same body (both
+        # stripped, as stored) => no new row, no event; the existing id is
+        # returned so the caller still succeeds.
+        prev = conn.execute(
+            "SELECT id, author, body FROM task_comments "
+            "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (prev is not None and prev["author"] == author.strip()
+                and prev["body"] == body.strip()):
+            return int(prev["id"])
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
@@ -3072,6 +3085,18 @@ def edit_task(
             changed_fields.append("result")
         if not assignments:
             return False
+        # Recovery trail for content rewrites: capture the values being
+        # overwritten so the `edited` event is reversible on its own.
+        previous: dict[str, str] = {}
+        if title is not None or body is not None:
+            old = conn.execute(
+                "SELECT title, body FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if old is not None:
+                if title is not None and title != (old["title"] or ""):
+                    previous["title"] = old["title"] or ""
+                if body is not None and body != (old["body"] or ""):
+                    previous["body"] = old["body"] or ""
         conn.execute(
             f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?",
             (*params, task_id),
@@ -3081,7 +3106,10 @@ def edit_task(
         if result is None:
             non_priority_fields = [field for field in changed_fields if field != "priority"]
             if non_priority_fields:
-                _append_event(conn, task_id, "edited", {"fields": non_priority_fields})
+                edited_payload: dict = {"fields": non_priority_fields}
+                if previous:
+                    edited_payload["previous"] = previous
+                _append_event(conn, task_id, "edited", edited_payload)
         else:
             handoff_summary = summary if summary is not None else result
             changed_fields.append("summary")
@@ -3559,17 +3587,20 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
-    when that is where it left off), closing any leaked run first."""
+    """``blocked``/``scheduled``/``triage`` -> its resumable phase (parent
+    re-gated; ``review`` when that is where it left off), closing any leaked
+    run first. ``triage`` is the loop-breaker's human-attention park
+    (``block_loop_detected``); unblocking it is the operator release that
+    makes the card dispatchable again."""
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
             _resume_status_from_events(conn, task_id)
-            if _task_status(conn, task_id) == "blocked"
+            if _task_status(conn, task_id) in ("blocked", "triage")
             else "ready"
         )
         _reclaim_dangling_run(
-            conn, task_id, statuses=("blocked", "scheduled"), now=now,
+            conn, task_id, statuses=("blocked", "scheduled", "triage"), now=now,
             note="invariant recovery on unblock",
         )
         # Re-gate on parent completion before restoring the source phase.
@@ -3587,7 +3618,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
+            "WHERE id = ? AND status IN ('blocked', 'scheduled', 'triage')", (new_status, task_id),
         )
         if cur.rowcount != 1:
             return False
@@ -3733,6 +3764,38 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def is_loop_parked_triage(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True while a triage card sits in triage because the block-loop breaker
+    routed it there — i.e. the newest ``block_loop_detected``/``unblocked``
+    event is the detection.
+
+    Such a card is a *human-attention park*, not a rough idea to re-specify:
+    the automatic specify/decompose sweeps must skip it, or the breaker's
+    escalation is undone on the very next tick (board incident 2026-10-21:
+    690 ``block_loop_detected`` → ``specified`` → ``promoted`` → re-claim
+    cycles, one real worker spawn each). ``unblock_task`` releases the park
+    (an explicit ``hermes kanban specify <id>`` also leaves triage by hand).
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN ('block_loop_detected', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "block_loop_detected"
+
+
+def sweepable_triage_ids(
+    conn: sqlite3.Connection, *, tenant: Optional[str] = None, limit: int = 1000,
+) -> list[str]:
+    """Triage task ids the automatic specify/decompose sweeps may take: every
+    triage card EXCEPT loop-parked ones (see :func:`is_loop_parked_triage`).
+    Explicit single-task ``specify``/``decompose`` by a human is unaffected —
+    only bulk sweeps filter."""
+    tasks = list_tasks(conn, status="triage", tenant=tenant, limit=limit, include_archived=False)
+    return [t.id for t in tasks if not is_loop_parked_triage(conn, t.id)]
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -3740,6 +3803,12 @@ def specify_triage_task(
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+
+    A rewrite records the overwritten ``title``/``body`` verbatim in the
+    ``specified`` event payload (``previous``) so any destructive re-spec is
+    diffable and reversible from the event log alone — the board incident
+    above lost an implementation-grade body to a stub with no recovery source
+    but grepping session transcripts.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
@@ -3773,6 +3842,13 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        # Recovery trail: the overwritten values ride the event payload so a
+        # destructive re-spec is reversible from task_events alone.
+        previous: dict[str, str] = {}
+        if "title" in changed_fields:
+            previous["title"] = existing["title"] or ""
+        if "body" in changed_fields:
+            previous["body"] = existing["body"] or ""
         if changed_fields and author and author.strip():
             # Not add_comment (own txn + 'commented' event); 'specified' below records it.
             _insert_comment(
@@ -3780,10 +3856,10 @@ def specify_triage_task(
                 "Specified — updated " + ", ".join(changed_fields) + " and promoted to todo.",
                 int(time.time()),
             )
-        _append_event(
-            conn, task_id, "specified",
-            {"changed_fields": changed_fields} if changed_fields else None,
-        )
+        payload: Optional[dict] = {"changed_fields": changed_fields} if changed_fields else None
+        if previous:
+            payload = {**(payload or {}), "previous": previous}
+        _append_event(conn, task_id, "specified", payload)
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
     recompute_ready(conn)

@@ -337,7 +337,8 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column EXCEPT loop-parked ones
+    (``block_loop_detected`` parks — see ``kb.is_loop_parked_triage``): the
+    auto-decompose sweep must not re-specify the breaker's escalations."""
     with kbc.connect_closing() as conn:
-        rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+        return kb.sweepable_triage_ids(conn, tenant=tenant)
